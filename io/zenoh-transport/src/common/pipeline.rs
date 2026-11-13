@@ -55,6 +55,9 @@ use crate::common::batch::BatchConfig;
 type BoxedWBatch = Box<WBatch>;
 
 const RBLEN: usize = QueueSizeConf::MAX;
+// The out ring holds a stage's batches and, besides them, the ephemeral batch of each stop
+// fragment: at most one after every regular batch, so twice the batches and one more fit.
+const RBLEN_OUT: usize = 4 * RBLEN;
 
 // Inner structure to reuse serialization batches
 struct StageInRefill {
@@ -114,7 +117,7 @@ struct AtomicBackoff {
 // Inner structure to link the initial stage with the final stage of the pipeline
 struct StageInOut {
     n_out_w: Notifier,
-    s_out_w: RingBufferWriter<BoxedWBatch, RBLEN>,
+    s_out_w: RingBufferWriter<BoxedWBatch, RBLEN_OUT>,
     atomic_backoff: Arc<AtomicBackoff>,
 }
 
@@ -129,7 +132,9 @@ impl StageInOut {
 
     #[inline]
     fn move_batch(&mut self, batch: BoxedWBatch) {
-        let _ = self.s_out_w.push(batch);
+        if self.s_out_w.push(batch).is_some() {
+            tracing::warn!("A batch was dropped: the out queue is full");
+        }
         self.atomic_backoff.bytes.store(0, Ordering::Relaxed);
         let _ = self.n_out_w.notify();
     }
@@ -434,6 +439,11 @@ impl StageIn {
                     });
                     if batch.encode(&stop).is_ok() {
                         self.s_out.move_batch(batch);
+                    } else {
+                        tracing::warn!(
+                            "The stop fragment of a dropped message could not be encoded: its SN {} is lost",
+                            fragment.sn
+                        );
                     }
                 }
             });
@@ -565,7 +575,7 @@ impl Backoff {
 
 // Inner structure to link the final stage with the initial stage of the pipeline
 struct StageOutIn {
-    s_out_r: RingBufferReader<BoxedWBatch, RBLEN>,
+    s_out_r: RingBufferReader<BoxedWBatch, RBLEN_OUT>,
     current: Arc<Mutex<Current>>,
     backoff: Backoff,
 }
@@ -756,7 +766,7 @@ impl TransmissionPipeline {
 
             // Create the refill ring buffer
             // This is a SPSC ring buffer
-            let (s_out_w, s_out_r) = RingBuffer::<BoxedWBatch, RBLEN>::init();
+            let (s_out_w, s_out_r) = RingBuffer::<BoxedWBatch, RBLEN_OUT>::init();
             let current = Arc::new(Mutex::new(Current {
                 batch: None,
                 status: status.clone(),
@@ -1168,7 +1178,7 @@ mod tests {
     use zenoh_codec::{RCodec, Zenoh080};
     use zenoh_config::{QueueAllocConf, QueueAllocMode};
     use zenoh_protocol::{
-        core::{Bits, CongestionControl, Priority},
+        core::{Bits, CongestionControl, Priority, Reliability},
         network::{ext, NetworkMessage, Push},
         transport::{BatchSize, Fragment, Frame, TransportBody, TransportSn},
     };
@@ -1340,60 +1350,77 @@ mod tests {
         Ok(())
     }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn tx_pipeline_stop_fragment_takes_the_next_sequence_number() -> ZResult<()> {
-        use zenoh_protocol::core::Reliability;
+    /// What a receiver reads on the DataHigh channels, in order.
+    #[derive(Debug)]
+    enum StopItem {
+        Fragment {
+            sn: TransportSn,
+            stop: bool,
+            first: bool,
+            more: bool,
+            priority: Priority,
+            len: usize,
+        },
+        Frame {
+            sn: TransportSn,
+        },
+    }
 
-        // What a receiver reads on one priority's reliable channel, in order.
-        #[derive(Debug)]
-        enum Item {
-            Fragment { sn: TransportSn, stop: bool },
-            Frame { sn: TransportSn },
-        }
-
-        // Two 1,024-byte batches, and a droppable message waits 1 ms for a batch:
-        // with nothing pulled, a 10,240-byte message gets two fragments out, the
-        // third finds no batch, and the message ends with a stop fragment.
+    /// A QoS pipeline of 1,024-byte batches, `queue_size` of them per priority, where a
+    /// droppable message waits 1 ms for a batch. `filled` express messages fill `filled`
+    /// batches; with nothing pulled, a droppable 10,240-byte message then takes the batches
+    /// left, the next fragment finds none, and the message ends with a stop fragment. A
+    /// blocking small message follows. Returns every item pulled, up to the small message's
+    /// frame.
+    async fn stop_fragment_items(queue_size: usize, filled: usize) -> ZResult<Vec<StopItem>> {
         let config = TransmissionPipelineConf {
             batch: BatchConfig {
                 mtu: 1_024,
                 ..CONFIG_NOT_STREAMED.batch
             },
-            queue_size: [2; Priority::NUM],
+            queue_size: [queue_size; Priority::NUM],
             wait_before_drop: Duration::from_millis(1),
             max_wait_before_drop_fragments: Duration::from_millis(1),
             ..CONFIG_NOT_STREAMED
         };
-        let tct = TransportPriorityTx::make(Bits::from(TransportSn::MAX))?;
-        let (producer, mut consumer) = TransmissionPipeline::make(config, &[tct], false);
+        let priorities = (0..Priority::NUM)
+            .map(|_| TransportPriorityTx::make(Bits::from(TransportSn::MAX)))
+            .collect::<ZResult<Vec<_>>>()?;
+        let (producer, mut consumer) = TransmissionPipeline::make(config, &priorities, false);
 
-        let message = |size: usize, congestion_control: CongestionControl| {
+        let message = |size: usize, congestion_control: CongestionControl, express: bool| {
             NetworkMessage::from(Push {
                 wire_expr: "test".into(),
-                ext_qos: ext::QoSType::new(Priority::Data, congestion_control, false),
+                ext_qos: ext::QoSType::new(Priority::DataHigh, congestion_control, express),
                 ..Push::from(vec![0_u8; size])
             })
         };
-        let large = message(10_240, CongestionControl::Drop);
-        let (producer, sent) = task::spawn_blocking(move || {
-            let sent = producer.push_network_message(large.as_ref()).unwrap();
-            (producer, sent)
+        let filler = message(8, CongestionControl::Block, true);
+        let large = message(10_240, CongestionControl::Drop, false);
+        let producer = task::spawn_blocking(move || {
+            for _ in 0..filled {
+                assert!(producer.push_network_message(filler.as_ref()).unwrap());
+            }
+            assert!(
+                !producer.push_network_message(large.as_ref()).unwrap(),
+                "the large message ran out of batches"
+            );
+            producer
         })
         .await
         .unwrap();
-        assert!(!sent, "the large message ran out of batches");
 
         // The small message waits for a batch that the pulls below refill.
-        let small = message(8, CongestionControl::Block);
+        let small = message(8, CongestionControl::Block, false);
         let push = task::spawn_blocking(move || {
-            producer.push_network_message(small.as_ref()).unwrap();
+            assert!(producer.push_network_message(small.as_ref()).unwrap());
             producer
         });
 
         // Pull every batch until the small message's frame, the last item sent.
         let items = timeout(TIMEOUT, async {
             let mut items = vec![];
-            while !matches!(items.last(), Some(Item::Frame { .. })) {
+            while items.len() <= filled || !matches!(items.last(), Some(StopItem::Frame { .. })) {
                 let (batch, priority) = consumer.pull().await.unwrap();
                 let mut reader = batch.as_slice().reader();
                 let codec = Zenoh080::new();
@@ -1402,18 +1429,25 @@ mod tests {
                     match res.map(|msg| msg.body) {
                         Ok(TransportBody::Fragment(Fragment {
                             reliability: Reliability::Reliable,
+                            more,
                             sn,
+                            payload,
+                            ext_qos,
+                            ext_first,
                             ext_drop,
-                            ..
-                        })) => items.push(Item::Fragment {
+                        })) => items.push(StopItem::Fragment {
                             sn,
                             stop: ext_drop.is_some(),
+                            first: ext_first.is_some(),
+                            more,
+                            priority: ext_qos.priority(),
+                            len: payload.len(),
                         }),
                         Ok(TransportBody::Frame(Frame {
                             reliability: Reliability::Reliable,
                             sn,
                             ..
-                        })) => items.push(Item::Frame { sn }),
+                        })) => items.push(StopItem::Frame { sn }),
                         Ok(_) => {}
                         Err(_) => break,
                     }
@@ -1425,23 +1459,73 @@ mod tests {
         .await
         .expect("the small message's frame was pulled in time");
         drop(push.await.unwrap());
+        Ok(items)
+    }
 
+    /// Exactly one stop fragment, right before the small message's frame, and every number
+    /// taken once.
+    fn assert_one_stop_then_the_small_message(items: &[StopItem]) {
         let stops = items
             .iter()
-            .filter(|item| matches!(item, Item::Fragment { stop: true, .. }))
+            .filter(|item| matches!(item, StopItem::Fragment { stop: true, .. }))
             .count();
         let sns: Vec<TransportSn> = items
             .iter()
             .map(|item| match item {
-                Item::Fragment { sn, .. } | Item::Frame { sn } => *sn,
+                StopItem::Fragment { sn, .. } | StopItem::Frame { sn } => *sn,
             })
             .collect();
         assert_eq!(stops, 1, "{items:?}");
         assert!(
-            matches!(items[items.len() - 2], Item::Fragment { stop: true, .. }),
+            matches!(
+                items[items.len() - 2],
+                StopItem::Fragment { stop: true, .. }
+            ),
             "{items:?}"
         );
         assert!(sns.windows(2).all(|w| w[1] == w[0] + 1), "{items:?}");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tx_pipeline_stop_fragment_takes_the_next_sequence_number() -> ZResult<()> {
+        let items = stop_fragment_items(2, 0).await?;
+        assert_one_stop_then_the_small_message(&items);
+
+        // The stop ends the chain, is not its first fragment, carries nothing, and keeps the
+        // fragments' priority.
+        let Some(StopItem::Fragment {
+            first,
+            more,
+            priority,
+            len,
+            ..
+        }) = items
+            .iter()
+            .find(|item| matches!(item, StopItem::Fragment { stop: true, .. }))
+        else {
+            unreachable!();
+        };
+        assert!(!first, "{items:?}");
+        assert!(!more, "{items:?}");
+        assert_eq!(*len, 0, "{items:?}");
+        assert_eq!(*priority, Priority::DataHigh, "{items:?}");
+        assert!(
+            items.iter().all(|item| match item {
+                StopItem::Fragment { priority, .. } => *priority == Priority::DataHigh,
+                StopItem::Frame { .. } => true,
+            }),
+            "{items:?}"
+        );
+
+        Ok(())
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn tx_pipeline_stop_fragment_survives_a_full_out_queue() -> ZResult<()> {
+        // Fourteen express messages each move a batch out: with the two fragments, every one of
+        // the sixteen batches is queued when the stop fragment's batch joins them.
+        let items = stop_fragment_items(QueueSizeConf::MAX, QueueSizeConf::MAX - 2).await?;
+        assert_one_stop_then_the_small_message(&items);
 
         Ok(())
     }
