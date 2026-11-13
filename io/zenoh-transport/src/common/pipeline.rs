@@ -413,7 +413,9 @@ impl StageIn {
         let mut reader = self.fragbuf.reader();
         while reader.can_read() {
             // Every fragment after the first takes the next SN when it is about to be
-            // written, so that no SN is taken after the last fragment
+            // written, so that no SN is taken after the last fragment. It is taken before
+            // the batch is acquired, so that a stop fragment sent because no batch came
+            // in time carries it
             if fragment.ext_first.is_none() {
                 fragment.sn = tch.sn.get();
             }
@@ -1160,7 +1162,7 @@ mod tests {
     use zenoh_codec::{RCodec, Zenoh080};
     use zenoh_config::{QueueAllocConf, QueueAllocMode};
     use zenoh_protocol::{
-        core::{Bits, CongestionControl, Priority},
+        core::{Bits, CongestionControl, Priority, Reliability},
         network::{ext, NetworkMessage, Push},
         transport::{BatchSize, Fragment, Frame, TransportBody, TransportSn},
     };
@@ -1334,8 +1336,6 @@ mod tests {
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn tx_pipeline_fragmented_message_leaves_no_sequence_gap() -> ZResult<()> {
-        use zenoh_protocol::core::Reliability;
-
         // What a receiver reads on one priority's reliable channel, in order.
         #[derive(Debug)]
         enum Item {
@@ -1344,7 +1344,7 @@ mod tests {
         }
 
         // A 1,024-byte batch, so that a 10,240-byte message leaves in fragments,
-        // and enough batches to hold them all and the message after them.
+        // and enough batches to hold them all and the messages around them.
         let config = TransmissionPipelineConf {
             batch: BatchConfig {
                 mtu: 1_024,
@@ -1363,19 +1363,28 @@ mod tests {
                 ..Push::from(vec![0_u8; size])
             })
         };
-        let (large, small) = (message(10_240), message(8));
+        // A small message on each side of the large one, so that a number skipped
+        // before the fragments shows as well as one skipped after them.
+        let (small, large) = (message(8), message(10_240));
         let producer = task::spawn_blocking(move || {
-            producer.push_network_message(large.as_ref()).unwrap();
-            producer.push_network_message(small.as_ref()).unwrap();
+            assert!(producer.push_network_message(small.as_ref()).unwrap());
+            assert!(producer.push_network_message(large.as_ref()).unwrap());
+            assert!(producer.push_network_message(small.as_ref()).unwrap());
             producer
         })
         .await
         .unwrap();
 
-        // Pull every batch until the small message's frame, the last item sent.
+        // Pull every batch until the second small message's frame, the last item sent.
+        let frames = |items: &[Item]| {
+            items
+                .iter()
+                .filter(|item| matches!(item, Item::Frame { .. }))
+                .count()
+        };
         let items = timeout(TIMEOUT, async {
             let mut items = vec![];
-            while !matches!(items.last(), Some(Item::Frame { .. })) {
+            while frames(&items) < 2 {
                 let (batch, priority) = consumer.pull().await.unwrap();
                 let mut reader = batch.as_slice().reader();
                 let codec = Zenoh080::new();
@@ -1401,7 +1410,7 @@ mod tests {
             items
         })
         .await
-        .expect("the small message's frame was pulled in time");
+        .expect("the second small message's frame was pulled in time");
         drop(producer);
 
         let fragments = items
@@ -1415,7 +1424,10 @@ mod tests {
             })
             .collect();
         assert!(fragments >= 10);
-        assert!(matches!(items.last(), Some(Item::Frame { .. })));
+        assert!(
+            matches!(items.first(), Some(Item::Frame { .. })),
+            "{items:?}"
+        );
         assert!(sns.windows(2).all(|w| w[1] == w[0] + 1), "{sns:?}");
 
         Ok(())
